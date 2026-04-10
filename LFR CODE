@@ -1,0 +1,322 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_now.h>
+
+// ================= WIFI =================
+const char* ssid     = "net";
+const char* password = "take1234";
+WebServer server(80);
+
+// ================= ESP-NOW =================
+uint8_t receiverMAC[] = {0x70, 0x4B, 0xCA, 0x8E, 0xEF, 0x08};
+
+typedef struct {
+  int pirValue;
+  int soundValue;
+} Message;
+
+typedef struct {
+  int ledOff;
+} Reply;
+
+extern int stopState;
+
+void onReply(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  Reply reply;
+  memcpy(&reply, data, sizeof(reply));
+  if (reply.ledOff == 1 && stopState == 2) {
+    stopState = 0;
+    Serial.println("LED is off — resuming early");
+  }
+}
+
+// ================= PIR =================
+#define PIR_PIN 4
+
+// ================= SOUND =================
+#define SOUND_PIN 15
+
+// ================= MOTOR PINS =================
+#define ENA 18
+#define IN1 5
+#define IN2 19
+#define ENB 23
+#define IN3 21
+#define IN4 22
+
+// ================= SENSOR PINS =================
+const int numSensors = 8;
+const int sensorPins[numSensors] = {32, 33, 25, 26, 27, 14, 12, 13};
+const int weights[8] = {-4, -3, -2, -1, 1, 2, 3, 4};
+
+// ================= PID =================
+float Kp = 100.0;
+float Ki = 0.0;
+float Kd = 25.0;
+float integral  = 0;
+int   lastError = 0;
+#define INTEGRAL_CLAMP 150
+
+// ================= SPEED =================
+const int baseSpeed = 170;
+const int maxSpeed  = 255;
+const int minSpeed  = 0;
+
+// ================= STATE =================
+String currentMode    = "STOPPED";
+int currentLeftSpeed  = 0;
+int currentRightSpeed = 0;
+unsigned long lastPrintTime = 0;
+
+// ================= STOP LOGIC =================
+int stopState = 0;
+unsigned long stopStateStart = 0;
+
+// ================================================
+//  WEB SERVER
+// ================================================
+void handleRoot() {
+  String html = "<html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0, user-scalable=no'>";
+  html += "<title>LFR Dashboard</title>";
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;background:#1a1a2e;color:white;margin:0;padding:20px;user-select:none}";
+  html += "h2{color:#e94560;margin-bottom:5px}";
+  html += ".stats{background:#16213e;padding:15px;border-radius:12px;display:inline-block;margin:10px auto;min-width:260px}";
+  html += ".mode{font-size:22px;font-weight:bold;color:#f5a623}";
+  html += ".speeds{font-size:16px;color:#aaa;margin-top:5px}";
+  html += ".btn{display:inline-block;padding:14px 22px;margin:6px;font-size:17px;color:white;border-radius:10px;font-weight:bold;min-width:90px;cursor:pointer;border:none}";
+  html += ".auto{background:#0f3460}";
+  html += ".stopbtn{background:#e94560;padding:16px 30px;font-size:20px}";
+  html += ".dir{background:#1a6b3c;font-size:26px;min-width:70px;padding:18px;-webkit-tap-highlight-color:transparent}";
+  html += ".dir:active{background:#145230}";
+  html += ".section{margin:18px 0}";
+  html += "table{margin:0 auto;border-spacing:8px}";
+  html += "</style></head><body>";
+
+  html += "<h2>Line Follower Robot</h2>";
+  html += "<p style='color:#aaa;margin-top:0'>IP: " + WiFi.localIP().toString() + "</p>";
+
+  html += "<div class='stats'>";
+  html += "<div class='mode' id='modeDisplay'>Mode: " + currentMode + "</div>";
+  html += "<div class='speeds'>L: " + String(currentLeftSpeed) + " | R: " + String(currentRightSpeed) + "</div>";
+  html += "</div>";
+
+  html += "<div class='section'>";
+  html += "<button class='btn auto' onclick=\"sendCmd('auto')\">▶ LINE FOLLOW</button>&nbsp;";
+  html += "<button class='btn stopbtn' onclick=\"sendCmd('stop')\">■ STOP</button>";
+  html += "</div>";
+
+  html += "<div class='section'><b style='color:#aaa'>MANUAL</b><br><br>";
+  html += "<table>";
+  html += "<tr><td></td><td><button class='btn dir' id='btn-fwd'>▲</button></td><td></td></tr>";
+  html += "<tr>";
+  html += "<td><button class='btn dir' id='btn-left'>↺</button></td>";
+  html += "<td style='width:70px'></td>";
+  html += "<td><button class='btn dir' id='btn-right'>↻</button></td>";
+  html += "</tr>";
+  html += "<tr><td></td><td><button class='btn dir' id='btn-bwd'>▼</button></td><td></td></tr>";
+  html += "</table></div>";
+
+  html += "<script>";
+  html += "function sendCmd(cmd){fetch('/action?cmd='+cmd);}";
+  html += "function hold(id,cmd){";
+  html += "  var el=document.getElementById(id);";
+  html += "  el.addEventListener('mousedown',function(){sendCmd(cmd);});";
+  html += "  el.addEventListener('touchstart',function(e){e.preventDefault();sendCmd(cmd);},{passive:false});";
+  html += "  el.addEventListener('mouseup',function(){sendCmd('stop');});";
+  html += "  el.addEventListener('mouseleave',function(){sendCmd('stop');});";
+  html += "  el.addEventListener('touchend',function(){sendCmd('stop');});";
+  html += "}";
+  html += "hold('btn-fwd','fwd');";
+  html += "hold('btn-bwd','bwd');";
+  html += "hold('btn-left','left');";
+  html += "hold('btn-right','right');";
+  html += "</script>";
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleAction() {
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    if      (cmd == "auto")  { currentMode = "AUTO";    stopState = 0; }
+    else if (cmd == "stop")  currentMode = "STOPPED";
+    else if (cmd == "fwd")   currentMode = "FWD";
+    else if (cmd == "bwd")   currentMode = "BWD";
+    else if (cmd == "left")  currentMode = "LEFT";
+    else if (cmd == "right") currentMode = "RIGHT";
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ================================================
+//  SETUP
+// ================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  for (int i = 0; i < numSensors; i++) pinMode(sensorPins[i], INPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(SOUND_PIN, INPUT);
+
+  // WiFi
+  IPAddress localIP(192, 168, 151, 100);
+  IPAddress gateway(192, 168, 151, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.config(localIP, gateway, subnet);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500); Serial.print("."); attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+    server.on("/", handleRoot);
+    server.on("/action", handleAction);
+    server.begin();
+  } else {
+    Serial.println("\nWiFi failed. Running offline.");
+  }
+
+  // ESP-NOW
+  esp_now_init();
+  esp_now_register_recv_cb(onReply);
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+// ================================================
+//  SENSOR & PID
+// ================================================
+int countActiveSensors() {
+  int count = 0;
+  for (int i = 0; i < numSensors; i++) {
+    if (digitalRead(sensorPins[i]) == 1) count++;
+  }
+  return count;
+}
+
+int calculateError() {
+  int sum = 0, active = 0;
+  for (int i = 0; i < numSensors; i++) {
+    if (digitalRead(sensorPins[i]) == 1) {
+      sum += weights[i];
+      active++;
+    }
+  }
+  if (active == 0) return lastError > 0 ? 4 : -4;
+  return sum / active;
+}
+
+// ================================================
+//  MOTOR CONTROL
+// ================================================
+void setMotors(int leftSpeed, int rightSpeed) {
+  if (leftSpeed >= 0) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
+  else                { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+  analogWrite(ENA, abs(leftSpeed));
+
+  if (rightSpeed >= 0) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+  else                 { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+  analogWrite(ENB, abs(rightSpeed));
+}
+
+// ================================================
+//  MAIN LOOP
+// ================================================
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) server.handleClient();
+
+  // ===== INTERSECTION STOP LOGIC =====
+  if (currentMode == "AUTO") {
+    int activeSensors = countActiveSensors();
+
+    if (stopState == 0 && activeSensors >= 6) {
+      stopState = 1;
+      stopStateStart = millis();
+    }
+
+    if (stopState == 1 && millis() - stopStateStart >= 100) {
+      stopState = 2;
+      stopStateStart = millis();
+      setMotors(0, 0);
+      currentLeftSpeed = 0; currentRightSpeed = 0;
+    }
+
+    if (stopState == 2) {
+      setMotors(0, 0);
+      currentLeftSpeed = 0; currentRightSpeed = 0;
+      if (millis() - stopStateStart >= 5000) stopState = 0;
+
+      if (millis() - lastPrintTime > 300) {
+        int pirVal   = digitalRead(PIR_PIN);
+        int soundVal = digitalRead(SOUND_PIN);
+        Serial.print("INTERSECTION STOP | PIR: ");
+        Serial.print(pirVal == HIGH ? "HUMAN DETECTED" : "no detection");
+        Serial.print(" | SOUND: ");
+        Serial.println(soundVal == HIGH ? "DETECTED" : "none");
+
+        Message msg;
+        msg.pirValue   = pirVal;
+        msg.soundValue = soundVal;
+        esp_now_send(receiverMAC, (uint8_t *)&msg, sizeof(msg));
+        lastPrintTime = millis();
+      }
+      return;
+    }
+  }
+
+  // ===== MODE HANDLING =====
+  if (currentMode == "AUTO") {
+    int error = calculateError();
+    integral += error;
+    integral = constrain(integral, -INTEGRAL_CLAMP, INTEGRAL_CLAMP);
+    float derivative = error - lastError;
+    int correction   = (int)((Kp * error) + (Ki * integral) + (Kd * derivative));
+    lastError = error;
+
+    int leftSpeed  = constrain(baseSpeed + correction, minSpeed, maxSpeed);
+    int rightSpeed = constrain(baseSpeed - correction, minSpeed, maxSpeed);
+    currentLeftSpeed  = leftSpeed;
+    currentRightSpeed = rightSpeed;
+    setMotors(leftSpeed, rightSpeed);
+
+  } else if (currentMode == "STOPPED") {
+    setMotors(0, 0);
+    currentLeftSpeed = 0; currentRightSpeed = 0;
+
+  } else if (currentMode == "FWD") {
+    setMotors(baseSpeed, baseSpeed);
+    currentLeftSpeed = baseSpeed; currentRightSpeed = baseSpeed;
+
+  } else if (currentMode == "BWD") {
+    setMotors(-baseSpeed, -baseSpeed);
+    currentLeftSpeed = -baseSpeed; currentRightSpeed = -baseSpeed;
+
+  } else if (currentMode == "LEFT") {
+    setMotors(-baseSpeed, baseSpeed);
+    currentLeftSpeed = -baseSpeed; currentRightSpeed = baseSpeed;
+
+  } else if (currentMode == "RIGHT") {
+    setMotors(baseSpeed, -baseSpeed);
+    currentLeftSpeed = baseSpeed; currentRightSpeed = -baseSpeed;
+  }
+
+  if (millis() - lastPrintTime > 300) {
+    Serial.print("Mode: "); Serial.print(currentMode);
+    Serial.print(" | L: "); Serial.print(currentLeftSpeed);
+    Serial.print(" | R: "); Serial.println(currentRightSpeed);
+    lastPrintTime = millis();
+  }
+}
