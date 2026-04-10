@@ -1,0 +1,105 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define LED_PIN    2
+#define BUTTON_PIN 4
+
+typedef struct {
+  int pirValue;
+  int soundValue;
+} Message;
+
+typedef struct {
+  int ledOff;  // 1 = led is off, resume moving
+} Reply;
+
+bool ledState = false;
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+#define DEBOUNCE_MS 100
+
+bool anyDetectionThisStop = false;
+unsigned long lastMsgTime = 0;
+bool senderPeerAdded = false;
+
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  Message msg;
+  memcpy(&msg, data, sizeof(msg));
+
+  // If gap > 1s since last message, this is a new stop session — reset
+  if (millis() - lastMsgTime > 1000) {
+    anyDetectionThisStop = false;
+  }
+  lastMsgTime = millis();
+
+  bool detected = (msg.pirValue == 1 || msg.soundValue == 1);
+
+  if (detected) {
+    anyDetectionThisStop = true;
+    ledState = true;
+    digitalWrite(LED_PIN, HIGH);
+  } else if (!anyDetectionThisStop) {
+    ledState = false;
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  Serial.print("PIR: "); Serial.print(msg.pirValue);
+  Serial.print(" | Sound: "); Serial.print(msg.soundValue);
+  Serial.println(ledState ? " → LED ON" : " → LED OFF");
+
+  // Add sender as peer once so we can reply
+  if (!senderPeerAdded) {
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, info->src_addr, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+    senderPeerAdded = true;
+  }
+
+  // If LED is off, tell the sender to resume immediately
+  if (!ledState) {
+    Reply reply;
+    reply.ledOff = 1;
+    esp_now_send(info->src_addr, (uint8_t *)&reply, sizeof(reply));
+    Serial.println("Sent resume signal to sender");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_STA);
+  delay(500);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+  Serial.println("Receiver ready");
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+  bool reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if (millis() - lastDebounceTime > DEBOUNCE_MS) {
+    if (reading == LOW) {
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      Serial.println(ledState ? "Button → LED ON" : "Button → LED OFF");
+      lastDebounceTime = millis();
+    }
+  }
+
+  lastButtonState = reading;
+}
